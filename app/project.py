@@ -756,17 +756,18 @@ class ProjectManager:
 
         print(f"Starting parallel generation of {total} chunks with {max_workers} workers...")
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(self.generate_chunk_audio, idx): idx
-                for idx in indices
-            }
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        futures = {
+            executor.submit(self.generate_chunk_audio, idx): idx
+            for idx in indices
+        }
 
-            cancelled = False
+        cancelled = False
+        try:
             for future in as_completed(futures):
                 if cancel_check and cancel_check():
                     cancelled = True
-                    print("[CANCEL] Cancellation requested — stopping parallel generation")
+                    print("[CANCEL] Cancellation requested - stopping parallel generation")
                     executor.shutdown(wait=False, cancel_futures=True)
                     break
 
@@ -785,6 +786,9 @@ class ProjectManager:
 
                 if progress_callback:
                     progress_callback(len(results["completed"]), len(results["failed"]), total)
+        finally:
+            if not cancelled:
+                executor.shutdown(wait=True)
 
             # Reset remaining "generating" chunks to "pending"
             if cancelled:
@@ -935,7 +939,13 @@ class ProjectManager:
                     })
 
             # Call batch TTS with single seed
-            batch_results = engine.generate_batch(batch_chunks, voice_config, self.root_dir, batch_seed)
+            batch_results = engine.generate_batch(
+                batch_chunks,
+                voice_config,
+                self.root_dir,
+                batch_seed,
+                cancel_check=cancel_check,
+            )
 
             # Process completed chunks - convert to MP3 and update status
             chunks = self.load_chunks()  # Reload for each batch

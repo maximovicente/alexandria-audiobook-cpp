@@ -222,6 +222,7 @@ class TTSConfig(BaseModel):
 class GenerationConfig(BaseModel):
     chunk_size: int = 3000
     max_tokens: int = 4096
+    enable_thinking: bool = False
     temperature: float = 0.6
     top_p: float = 0.8
     top_k: int = 0
@@ -1277,8 +1278,10 @@ async def cancel_audio():
     if process_state["audio"]["running"]:
         process_state["audio"]["cancel"] = True
         process_state["audio"]["logs"].append("[CANCEL] Cancellation requested")
-        return {"status": "cancelling"}
-    
+        status = "cancelling"
+    else:
+        status = "not_running"
+
     reset_count = 0
     chunks = project_manager.load_chunks()
     if chunks:
@@ -1288,7 +1291,7 @@ async def cancel_audio():
                 reset_count += 1
         if reset_count:
             project_manager.save_chunks(chunks)
-    return {"status": "not_running", "reset_chunks": reset_count}
+    return {"status": status, "reset_chunks": reset_count}
 
 ## ── Saved Scripts ──────────────────────────────────────────────
 

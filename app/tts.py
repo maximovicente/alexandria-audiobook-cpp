@@ -1305,7 +1305,7 @@ class TTSEngine:
             print(f"[Blackwell Core] Native GGUF download failed for {filename}: {exc}")
             return None
 
-    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1):
+    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None):
         """Root master batch supervisor overridden natively to process chunks via parallel Blackwell C++ binaries."""
         import time
         import json
@@ -1317,6 +1317,8 @@ class TTSEngine:
 
         batch_start_time = time.time()
         results = {"completed": [], "failed": []}
+        if cancel_check and cancel_check():
+            return results
         groups = {"custom": [], "clone": [], "lora": [], "design": []}
         for chunk in chunks:
             voice_data = self._voice_data(chunk.get("speaker", ""), voice_config)
@@ -1357,7 +1359,8 @@ class TTSEngine:
         if groups["custom"]:
             if self._backend == "cpp":
                 custom_results = self._local_batch_custom(
-                    groups["custom"], voice_config, output_dir, batch_seed
+                    groups["custom"], voice_config, output_dir, batch_seed,
+                    cancel_check=cancel_check,
                 )
             else:
                 custom_results = self._local_batch_python(
@@ -1501,7 +1504,7 @@ class TTSEngine:
 
         return results
 
-    def _local_batch_custom(self, chunks, voice_config, output_dir, batch_seed=-1):
+    def _local_batch_custom(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None):
         """Batch generate custom voice utilizing concurrent execution of optimized C++ binaries with cloning support."""
         import struct
         import json
@@ -1511,11 +1514,15 @@ class TTSEngine:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         results = {"completed": [], "failed": []}
+        if cancel_check and cancel_check():
+            return results
 
         exe_path = self._cpp_executable
         binary_dir = os.path.dirname(exe_path)
         model_path = self._ensure_cpp_model("custom")
         codec_path = self._ensure_cpp_codec()
+        if cancel_check and cancel_check():
+            return results
         if not model_path or not codec_path:
             error = "Native C++ CustomVoice model or tokenizer is unavailable."
             print(f"[TTS] {error}")
@@ -1622,15 +1629,25 @@ class TTSEngine:
                 return idx, False, 0, str(e)
 
         total_audio_time = 0
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_chunk = {executor.submit(process_single_chunk, chunk): chunk for chunk in chunks}
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        future_to_chunk = {executor.submit(process_single_chunk, chunk): chunk for chunk in chunks}
+        cancelled = False
+        try:
             for future in as_completed(future_to_chunk):
+                if cancel_check and cancel_check():
+                    cancelled = True
+                    print("[CANCEL] Cancellation requested - stopping native batch generation")
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
                 p_idx, success, duration, error_msg = future.result()
                 if success:
                     results["completed"].append(p_idx)
                 else:
                     results["failed"].append((p_idx, error_msg))
                     print(f" -> [Blackwell Core] Chunk {p_idx} FAILED: {error_msg}")
+        finally:
+            if not cancelled:
+                executor.shutdown(wait=True)
 
         return results
 

@@ -77,7 +77,8 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
                  previous_tail=None, source_context=None, max_retries=2,
                  system_prompt=None, user_prompt_template=None,
                  max_tokens=8000, temperature=0.4, top_p=0.8, top_k=20,
-                 min_p=0, presence_penalty=0.0, banned_tokens=None):
+                 min_p=0, presence_penalty=0.0, banned_tokens=None,
+                 enable_thinking=False):
     """Send a batch of script entries through the LLM for review and correction."""
     sys_prompt = system_prompt or REVIEW_SYSTEM_PROMPT
     usr_template = user_prompt_template or REVIEW_USER_PROMPT
@@ -116,6 +117,7 @@ def review_batch(client, model_name, batch_entries, batch_num, total_batches,
                         "top_k": top_k,
                         "min_p": min_p,
                         "banned_tokens": banned_tokens if banned_tokens else None,
+                        "chat_template_kwargs": {"enable_thinking": enable_thinking},
                     }.items() if v is not None
                 }
             )
@@ -306,6 +308,7 @@ def main():
     min_p = generation_config.get("min_p", 0)
     presence_penalty = generation_config.get("presence_penalty", 0.0)
     banned_tokens = generation_config.get("banned_tokens", [])
+    enable_thinking = generation_config.get("enable_thinking", False)
 
     print(f"Connecting to: {base_url}")
     print(f"Using model: {model_name}")
@@ -363,7 +366,8 @@ def main():
                 top_k=top_k,
                 min_p=min_p,
                 presence_penalty=presence_penalty,
-                banned_tokens=banned_tokens
+                banned_tokens=banned_tokens,
+                enable_thinking=enable_thinking
             )
 
             if corrected is None:
@@ -435,7 +439,8 @@ def main():
                 top_k=top_k,
                 min_p=min_p,
                 presence_penalty=presence_penalty,
-                banned_tokens=banned_tokens
+                banned_tokens=banned_tokens,
+                enable_thinking=enable_thinking
             )
 
             if corrected is None:

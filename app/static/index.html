@@ -298,7 +298,12 @@
                             <div class="mb-3">
                                 <label class="form-label">Banned Tokens</label>
                                 <input type="text" class="form-control" id="banned-tokens" placeholder="e.g. <think>, <reasoning>">
-                                <div class="form-text">Comma-separated tokens the LLM is forbidden from generating. Use to disable thinking mode (e.g. <code>&lt;think&gt;</code>).</div>
+                                <div class="form-text">Comma-separated tokens the LLM is forbidden from generating. Use the thinking-mode switch below for Qwen3.8 reasoning control.</div>
+                            </div>
+                            <div class="mb-3 form-check form-switch">
+                                <input class="form-check-input" type="checkbox" id="enable-thinking">
+                                <label class="form-check-label" for="enable-thinking">Enable model thinking mode</label>
+                                <div class="form-text">For Qwen3.8 and compatible models. Off is recommended for direct JSON script output.</div>
                             </div>
                             <div class="mb-3 form-check form-switch">
                                 <input class="form-check-input" type="checkbox" id="merge-narrators">
@@ -1316,6 +1321,7 @@
                     if (config.generation.presence_penalty != null) {
                         document.getElementById('presence-penalty').value = config.generation.presence_penalty;
                     }
+                    document.getElementById('enable-thinking').checked = !!config.generation.enable_thinking;
                     if (config.generation.banned_tokens && config.generation.banned_tokens.length > 0) {
                         document.getElementById('banned-tokens').value = config.generation.banned_tokens.join(', ');
                     }
@@ -1365,6 +1371,7 @@
             document.getElementById('min-p').value = 0;
             document.getElementById('presence-penalty').value = 0;
             document.getElementById('banned-tokens').value = '';
+            document.getElementById('enable-thinking').checked = false;
             document.getElementById('merge-narrators').checked = false;
         };
 
@@ -1431,6 +1438,7 @@
                     top_k: parseInt(document.getElementById('top-k').value),
                     min_p: parseFloat(document.getElementById('min-p').value),
                     presence_penalty: parseFloat(document.getElementById('presence-penalty').value),
+                    enable_thinking: document.getElementById('enable-thinking').checked,
                     banned_tokens: document.getElementById('banned-tokens').value
                         ? document.getElementById('banned-tokens').value.split(',').map(t => t.trim()).filter(t => t)
                         : [],

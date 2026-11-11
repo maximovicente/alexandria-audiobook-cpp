@@ -158,7 +158,7 @@ def _collect_narrator_context(script, speaker, window=4):
     return context_lines
 
 
-def _resolve_aliases_batch(client, model_name, speakers_info, existing_names):
+def _resolve_aliases_batch(client, model_name, speakers_info, existing_names, enable_thinking=False):
     """Resolve aliases for all speakers in a single one-shot LLM call.
 
     speakers_info is a dict:
@@ -217,6 +217,7 @@ def _resolve_aliases_batch(client, model_name, speakers_info, existing_names):
             ],
             temperature=0.1,
             max_tokens=max(1500, len(speakers_info) * 80),
+            extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
         )
         result = extract_json_object(response.choices[0].message.content.strip())
         if isinstance(result, dict):
@@ -521,7 +522,7 @@ def _save_generated_preview(root, engine, voice_config, speaker, description, re
         return False
 
 
-def run_advanced_persona_generation(script, selected_speakers, samples, voice_config, client, model_name, engine, root, args, system_prompt=None, advanced_prompt=None):
+def run_advanced_persona_generation(script, selected_speakers, samples, voice_config, client, model_name, engine, root, args, system_prompt=None, advanced_prompt=None, enable_thinking=False):
     ref_dir = os.path.join(root, "persona_refs")
     os.makedirs(ref_dir, exist_ok=True)
 
@@ -543,6 +544,7 @@ def run_advanced_persona_generation(script, selected_speakers, samples, voice_co
                 ],
                 temperature=0.2,
                 max_tokens=4000,
+                extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
             )
             raw_content = response.choices[0].message.content.strip()
             parsed = extract_json_object(raw_content)
@@ -597,6 +599,7 @@ def run_advanced_persona_generation(script, selected_speakers, samples, voice_co
                 ],
                 temperature=0.25,
                 max_tokens=600,
+                extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
             )
             parsed = extract_json_object(response.choices[0].message.content.strip())
             if parsed:
@@ -676,6 +679,7 @@ def main():
     base_url = llm_cfg.get("base_url", "http://localhost:11434/v1")
     api_key = llm_cfg.get("api_key", "local")
     model_name = llm_cfg.get("model_name", "richardyoung/qwen3-14b-abliterated:Q8_0")
+    enable_thinking = config.get("generation", {}).get("enable_thinking", False)
 
     client = OpenAI(base_url=base_url, api_key=api_key)
 
@@ -725,6 +729,7 @@ def main():
             args=args,
             system_prompt=persona_system,
             advanced_prompt=persona_advanced,
+            enable_thinking=enable_thinking,
         )
         try:
             _atomic_json_write(voice_config, voice_config_path)
@@ -780,7 +785,7 @@ def main():
             existing_configured = list(voice_config.keys()) + list(batch_mapping.values())
             
             print(f"Resolving alias batch {idx//chunk_size + 1} ({len(chunk)} speakers)...")
-            chunk_mapping = _resolve_aliases_batch(client, model_name, speakers_info, existing_configured)
+            chunk_mapping = _resolve_aliases_batch(client, model_name, speakers_info, existing_configured, enable_thinking=enable_thinking)
             batch_mapping.update(chunk_mapping)
 
         # Build case-insensitive normalized lookup mapping to survive LLM key casing changes
@@ -838,6 +843,7 @@ def main():
                 ],
                 temperature=0.3,
                 max_tokens=400,
+                extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
             )
 
             text = response.choices[0].message.content.strip()
