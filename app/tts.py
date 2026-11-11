@@ -6,6 +6,11 @@ import shutil
 import numpy as np
 import soundfile as sf
 from pydub import AudioSegment
+import subprocess
+import urllib.request
+import urllib.error
+import base64
+import hashlib
 
 DEFAULT_PAUSE_MS = 500  # Pause between different speakers
 SAME_SPEAKER_PAUSE_MS = 250  # Shorter pause for same speaker continuing
@@ -98,6 +103,21 @@ class TTSEngine:
     def __init__(self, config):
         tts_config = config.get("tts", {})
         self._mode = tts_config.get("mode", "external")
+        self._backend = tts_config.get("backend", "cpp")
+        self._cpp_executable = tts_config.get(
+            "cpp_executable",
+            r"native\qwentts-cpp\build\Release\qwen-tts.exe",
+        )
+        self._cpp_model_dir = tts_config.get(
+            "cpp_model_dir",
+            r"native\qwentts-cpp\models",
+        )
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self._cpp_executable = self._resolve_cpp_path(self._cpp_executable, project_root)
+        self._cpp_model_dir = self._resolve_cpp_path(self._cpp_model_dir, project_root)
+        self._cpp_auto_download = bool(tts_config.get("cpp_auto_download", True))
+        self._cpp_server_port = int(tts_config.get("cpp_server_port", 4211))
+        self._python_fallback = bool(tts_config.get("python_fallback", False))
         self._url = tts_config.get("url", "http://127.0.0.1:7860")
         self._device = tts_config.get("device", "auto")
         self._compile_codec_enabled = tts_config.get("compile_codec", False)
@@ -120,6 +140,16 @@ class TTSEngine:
         self._warmup_needed = True  # cleared after first batch warmup
         self._lora_adapter_path = None  # track which adapter is currently loaded
         self._gradio_client = None
+        self._cpp_clone_server = None
+        self._cpp_clone_voice = None
+        self._cpp_server_model = None
+        self._cpp_clone_server_lock = threading.Lock()
+
+    @staticmethod
+    def _resolve_cpp_path(value, project_root):
+        if os.path.isabs(value):
+            return value
+        return os.path.abspath(os.path.join(project_root, value))
 
         # Clone prompt cache: speaker_name -> (ref_audio_path, reusable voice_clone_prompt)
         self._clone_prompt_cache = {}
@@ -665,7 +695,7 @@ class TTSEngine:
 
     def _get_clone_prompt(self, speaker, voice_config):
         """Get or create a cached voice clone prompt for a speaker."""
-        voice_data = voice_config.get(speaker, {})
+        voice_data = self._voice_data(speaker, voice_config)
         ref_audio_path = voice_data.get("ref_audio")
         ref_text = voice_data.get("ref_text")
 
@@ -718,14 +748,258 @@ class TTSEngine:
         else:
             return self._external_generate_clone(text, speaker, voice_config, output_path)
 
+    def _generate_cpp_voice(self, text, instruct_text, speaker, voice_config, output_path):
+        """Generate one line with qwen-tts.cpp when the matching GGUF exists.
+
+        Returns None when this voice type is not available in the native backend,
+        allowing the existing Python implementation to handle it.
+        """
+        import time
+        import wave
+
+        exe_path = self._cpp_executable
+        binary_dir = os.path.dirname(exe_path)
+        codec_path = os.path.join(self._cpp_model_dir, "qwen-tokenizer-12hz-Q8_0.gguf")
+        models_dir = self._cpp_model_dir
+
+        if self._backend != "cpp" or not os.path.isfile(exe_path):
+            return None
+
+        voice_data = self._voice_data(speaker, voice_config)
+        voice_type = voice_data.get("type", "custom")
+        if voice_type == "custom":
+            model_path = self._ensure_cpp_model("custom")
+            codec_path = self._ensure_cpp_codec()
+            if not model_path or not codec_path:
+                return None
+            speaker_value = (voice_data.get("voice") or speaker).lower()
+            instruct_value = (instruct_text or voice_data.get("default_style") or "neutral").strip()
+            print(f"[Blackwell Core] Generating single {voice_type} segment for '{speaker}'...")
+            generation_start = time.time()
+            try:
+                self._ensure_cpp_synthesis_server(model_path, codec_path)
+                self._request_cpp_speech(
+                    text,
+                    speaker_value if speaker_value != "narrator" else "serena",
+                    instruct_value,
+                    output_path,
+                )
+            except Exception as exc:
+                print(f"[Blackwell Core] Native CustomVoice server failed: {exc}")
+                return False
+            elapsed = time.time() - generation_start
+            audio_duration = self._wav_duration(output_path)
+            print(
+                f" -> [Metrics] Single Runtime: {elapsed:.2f}s | "
+                f"Audio Generated: {audio_duration:.2f}s | "
+                f"RTF: {elapsed / max(audio_duration, 0.001):.3f}"
+            )
+            print(f"[Blackwell Core] Single-segment WAV written to {output_path}")
+            return True
+        elif voice_type == "clone":
+            model_path = self._ensure_cpp_model("base")
+            codec_path = self._ensure_cpp_codec()
+            ref_audio_path = voice_data.get("ref_audio")
+            ref_text = voice_data.get("ref_text")
+            if not model_path or not ref_audio_path or not ref_text:
+                if not model_path:
+                    print(
+                        "[Blackwell Core] Native clone model unavailable; "
+                        "using the configured Python clone backend."
+                    )
+                return None
+            if not os.path.isabs(ref_audio_path):
+                root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                ref_audio_path = os.path.join(root_dir, ref_audio_path)
+            if not os.path.isfile(ref_audio_path):
+                return None
+            print(f"[Blackwell Core] Generating single {voice_type} segment for '{speaker}'...")
+            generation_start = time.time()
+            try:
+                voice_key = self._ensure_cpp_clone_server(
+                    model_path, codec_path, ref_audio_path, ref_text
+                )
+                self._request_cpp_clone(text, voice_key, output_path)
+            except Exception as exc:
+                print(f"[Blackwell Core] Native clone server failed: {exc}")
+                return False
+            elapsed = time.time() - generation_start
+            audio_duration = self._wav_duration(output_path)
+            print(
+                f" -> [Metrics] Single Runtime: {elapsed:.2f}s | "
+                f"Audio Generated: {audio_duration:.2f}s | "
+                f"RTF: {elapsed / max(audio_duration, 0.001):.3f}"
+            )
+            print(f"[Blackwell Core] Single-segment WAV written to {output_path}")
+            return True
+        else:
+            return None
+
+        print(f"[Blackwell Core] Generating single {voice_type} segment for '{speaker}'...")
+        generation_start = time.time()
+        try:
+            completed = subprocess.run(
+                args,
+                input=text.encode("utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                cwd=binary_dir,
+                check=False,
+            )
+        except OSError as exc:
+            print(f"[Blackwell Core] Native generation unavailable: {exc}")
+            return None
+        finally:
+            pass
+
+        if completed.returncode != 0 or not os.path.isfile(output_path):
+            output = completed.stdout.decode("utf-8", errors="replace").strip()
+            print(f"[Blackwell Core] Single-segment generation failed ({completed.returncode}): {output}")
+            return False
+
+        elapsed = time.time() - generation_start
+        try:
+            with wave.open(output_path, "rb") as wav_file:
+                audio_duration = wav_file.getnframes() / max(wav_file.getframerate(), 1)
+        except (wave.Error, OSError):
+            audio_duration = max((os.path.getsize(output_path) - 44) / 24000.0, 0.0)
+        rtf = elapsed / max(audio_duration, 0.001)
+        print(
+            f" -> [Metrics] Single Runtime: {elapsed:.2f}s | "
+            f"Audio Generated: {audio_duration:.2f}s | RTF: {rtf:.3f}"
+        )
+        print(f"[Blackwell Core] Single-segment WAV written to {output_path}")
+        return True
+
+    @staticmethod
+    def _wav_duration(path):
+        import wave
+        try:
+            with wave.open(path, "rb") as wav_file:
+                return wav_file.getnframes() / max(wav_file.getframerate(), 1)
+        except (wave.Error, OSError):
+            return max((os.path.getsize(path) - 44) / 24000.0, 0.0)
+
+    def _cpp_server_url(self, suffix):
+        return f"http://127.0.0.1:{self._cpp_server_port}{suffix}"
+
+    def _cpp_server_get(self, suffix):
+        with urllib.request.urlopen(self._cpp_server_url(suffix), timeout=2) as response:
+            return response.read()
+
+    def _ensure_cpp_clone_server(self, model_path, codec_path, ref_audio_path, ref_text):
+        import time
+
+        self._ensure_cpp_synthesis_server(model_path, codec_path)
+
+        voice_key = hashlib.sha256(
+            (os.path.abspath(ref_audio_path) + "\0" + ref_text).encode("utf-8")
+        ).hexdigest()[:16]
+        with self._cpp_clone_server_lock:
+            if self._cpp_clone_voice != voice_key:
+                with open(ref_audio_path, "rb") as ref_file:
+                    wav_b64 = base64.b64encode(ref_file.read()).decode("ascii")
+                self._post_cpp_json("/v1/audio/voices", {
+                    "name": voice_key,
+                    "ref_text": ref_text,
+                    "wav_b64": wav_b64,
+                })
+                self._cpp_clone_voice = voice_key
+            return voice_key
+
+    def _ensure_cpp_synthesis_server(self, model_path, codec_path):
+        import time
+
+        with self._cpp_clone_server_lock:
+            if self._cpp_server_model == model_path:
+                try:
+                    self._cpp_server_get("/health")
+                    return
+                except (OSError, urllib.error.URLError):
+                    self._cpp_server_model = None
+
+            if self._cpp_clone_server is not None and self._cpp_clone_server.poll() is None:
+                self._cpp_clone_server.terminate()
+                try:
+                    self._cpp_clone_server.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._cpp_clone_server.kill()
+                self._cpp_clone_server = None
+                self._cpp_server_model = None
+
+            server_path = os.path.join(os.path.dirname(self._cpp_executable), "tts-server.exe")
+            if not os.path.isfile(server_path):
+                raise FileNotFoundError(f"Native server not found: {server_path}")
+            self._cpp_clone_server = subprocess.Popen(
+                [
+                    server_path, "--model", model_path, "--codec", codec_path,
+                    "--host", "127.0.0.1", "--port", str(self._cpp_server_port),
+                    "--lang", self._language, "--max-batch", "4",
+                ],
+                cwd=os.path.dirname(server_path),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            for _ in range(120):
+                try:
+                    self._cpp_server_get("/health")
+                    self._cpp_server_model = model_path
+                    self._cpp_clone_voice = None
+                    return
+                except (OSError, urllib.error.URLError):
+                    time.sleep(0.25)
+            raise RuntimeError("Native TTS server did not become ready")
+
+    def _post_cpp_json(self, suffix, payload):
+        request = urllib.request.Request(
+            self._cpp_server_url(suffix),
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=300) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Native server HTTP {exc.code}: {detail}") from exc
+
+    def _request_cpp_clone(self, text, voice, output_path):
+        self._request_cpp_speech(text, voice, "", output_path)
+
+    def _request_cpp_speech(self, text, voice, instruct, output_path):
+        payload = {
+            "input": text,
+            "voice": voice,
+            "language": self._language,
+            "response_format": "wav",
+            "max_new_tokens": 512,
+        }
+        if instruct:
+            payload["instructions"] = instruct
+        body = self._post_cpp_json("/v1/audio/speech", payload)
+        with open(output_path, "wb") as output_file:
+            output_file.write(body)
+
     def generate_voice(self, text, instruct_text, speaker, voice_config, output_path):
         """Generate audio using the appropriate method based on voice type config."""
-        voice_data = voice_config.get(speaker)
+        voice_data = self._voice_data(speaker, voice_config)
         if not voice_data:
             print(f"Warning: No voice configuration for '{speaker}'. Skipping.")
             return False
 
         voice_type = voice_data.get("type", "custom")
+
+        if self._mode == "local" and self._backend == "cpp":
+            cpp_result = self._generate_cpp_voice(
+                text, instruct_text, speaker, voice_config, output_path
+            )
+            if cpp_result is not None:
+                return cpp_result
+            if not self._python_fallback:
+                print(f"[TTS] Native C++ backend cannot handle voice '{speaker}'. Python fallback is disabled.")
+                return False
 
         if voice_type == "clone":
             return self.generate_clone_voice(text, speaker, voice_config, output_path)
@@ -938,376 +1212,376 @@ class TTSEngine:
 
     # ── Batch generation ─────────────────────────────────────────
 
+    @staticmethod
+    def _voice_data(speaker, voice_config):
+        voice_data = voice_config.get(speaker)
+        if voice_data is not None:
+            return voice_data
+        return next(
+            (value for key, value in voice_config.items()
+             if key.casefold() == speaker.casefold()),
+            {},
+        )
+
+    def _cpp_base_model_path(self):
+        return self._ensure_cpp_model("base", download=False)
+
+    def _ensure_cpp_codec(self):
+        """Return the native tokenizer GGUF, downloading it on first use."""
+        return self._ensure_cpp_asset("qwen-tokenizer-12hz-Q8_0.gguf")
+
+    def _ensure_cpp_model(self, variant, download=None):
+        filenames = {
+            "custom": "qwen-talker-1.7b-customvoice-Q8_0.gguf",
+            "base": "qwen-talker-1.7b-base-Q8_0.gguf",
+        }
+        filename = filenames.get(variant)
+        if not filename:
+            return None
+        return self._ensure_cpp_asset(filename, download=download)
+
+    def _ensure_cpp_asset(self, filename, download=None):
+        path = os.path.join(self._cpp_model_dir, filename)
+        if os.path.isfile(path):
+            return path
+        if download is False or not self._cpp_auto_download:
+            return None
+
+        try:
+            from huggingface_hub import hf_hub_download
+
+            os.makedirs(self._cpp_model_dir, exist_ok=True)
+            print(f"[Blackwell Core] Downloading native GGUF asset: {filename}")
+            downloaded = hf_hub_download(
+                repo_id="Serveurperso/Qwen3-TTS-GGUF",
+                filename=filename,
+                local_dir=self._cpp_model_dir,
+            )
+            return downloaded if os.path.isfile(downloaded) else path
+        except Exception as exc:
+            print(f"[Blackwell Core] Native GGUF download failed for {filename}: {exc}")
+            return None
+
     def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1):
-        """Generate multiple audio files.
+        """Root master batch supervisor overridden natively to process chunks via parallel Blackwell C++ binaries."""
+        import time
+        import json
 
-        Local mode: uses native list-based batch API for custom voices.
-        External mode: sequential individual calls.
+        if not hasattr(self, "_global_start_time") or self._global_start_time == 0:
+            self._global_start_time = time.time()
+            self._global_audio_duration = 0.0
+            self._processed_chunks_counter = 0
 
-        Args:
-            chunks: List of dicts with 'text', 'instruct', 'speaker', 'index' keys
-            voice_config: Voice configuration dict
-            output_dir: Directory to save output files
-            batch_seed: Single seed for all generations (-1 for random)
-
-        Returns:
-            dict with 'completed' (list of indices) and 'failed' (list of (index, error) tuples)
-        """
+        batch_start_time = time.time()
         results = {"completed": [], "failed": []}
-
-        if not chunks:
-            return results
-
-        # Reset torch.compile state to prevent progressive slowdown
-        # from dynamo guard accumulation across batches
-        if self._compile_codec_enabled:
-            self._reset_compile_cache()
-
-        # Separate chunks by voice type
-        custom_chunks = []
-        clone_chunks = []
-        lora_chunks = []
-        design_chunks = []
-
+        groups = {"custom": [], "clone": [], "lora": [], "design": []}
         for chunk in chunks:
-            speaker = chunk.get("speaker")
-            voice_data = voice_config.get(speaker, {})
+            voice_data = self._voice_data(chunk.get("speaker", ""), voice_config)
             voice_type = voice_data.get("type", "custom")
-
-            if voice_type == "clone":
-                clone_chunks.append(chunk)
-            elif voice_type in ("lora", "builtin_lora"):
-                lora_chunks.append(chunk)
-            elif voice_type == "design":
-                design_chunks.append(chunk)
+            if voice_type in ("lora", "builtin_lora"):
+                group_name = "lora"
+            elif voice_type in groups:
+                group_name = voice_type
             else:
-                custom_chunks.append(chunk)
+                group_name = "custom"
+            groups[group_name].append(chunk)
 
-        # Process custom voice chunks
-        if custom_chunks:
-            if self._mode == "local":
-                batch_results = self._local_batch_custom(custom_chunks, voice_config, output_dir, batch_seed)
-            else:
-                batch_results = self._sequential_custom(custom_chunks, voice_config, output_dir, batch_seed)
-            results["completed"].extend(batch_results["completed"])
-            results["failed"].extend(batch_results["failed"])
-            self._clear_gpu_cache()
-
-        # Process clone voice chunks (batched by speaker in local mode)
-        if clone_chunks:
-            if self._mode == "local":
-                batch_results = self._local_batch_clone(clone_chunks, voice_config, output_dir)
-            else:
-                batch_results = {"completed": [], "failed": []}
-                for chunk in clone_chunks:
-                    idx = chunk["index"]
-                    output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
-                    try:
-                        success = self.generate_clone_voice(
-                            chunk["text"], chunk["speaker"], voice_config, output_path
-                        )
-                        if success:
-                            batch_results["completed"].append(idx)
-                        else:
-                            batch_results["failed"].append((idx, "Clone voice generation failed"))
-                    except Exception as e:
-                        batch_results["failed"].append((idx, str(e)))
-            results["completed"].extend(batch_results["completed"])
-            results["failed"].extend(batch_results["failed"])
-            self._clear_gpu_cache()
-
-        # Process LoRA voice chunks (batched by adapter in local mode)
-        if lora_chunks:
-            if self._mode == "local":
-                batch_results = self._local_batch_lora(lora_chunks, voice_config, output_dir)
-            else:
-                batch_results = {"completed": [], "failed": []}
-                for chunk in lora_chunks:
-                    idx = chunk["index"]
-                    output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
-                    speaker = chunk.get("speaker")
-                    voice_data = voice_config.get(speaker, {})
-                    try:
-                        success = self.generate_lora_voice(
-                            text=chunk["text"],
-                            instruct_text=chunk.get("instruct", ""),
-                            voice_data=voice_data,
-                            output_path=output_path,
-                        )
-                        if success:
-                            batch_results["completed"].append(idx)
-                        else:
-                            batch_results["failed"].append((idx, "LoRA voice generation failed"))
-                    except Exception as e:
-                        batch_results["failed"].append((idx, str(e)))
-            results["completed"].extend(batch_results["completed"])
-            results["failed"].extend(batch_results["failed"])
-            self._clear_gpu_cache()
-
-        # Process design voice chunks (sequential — each line has unique description)
-        if design_chunks:
-            for chunk in design_chunks:
+        if self._mode == "external":
+            for chunk in chunks:
                 idx = chunk["index"]
                 output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
-                speaker = chunk.get("speaker")
-                voice_data = voice_config.get(speaker, {})
-                try:
-                    success = self.generate_design_voice(
-                        text=chunk["text"],
-                        instruct_text=chunk.get("instruct", ""),
-                        voice_data=voice_data,
-                        output_path=output_path,
-                    )
-                    if success:
-                        results["completed"].append(idx)
-                    else:
-                        results["failed"].append((idx, "Design voice generation failed"))
-                except Exception as e:
-                    results["failed"].append((idx, str(e)))
+                if self.generate_voice(
+                    chunk.get("text", ""), chunk.get("instruct", ""),
+                    chunk.get("speaker", ""), voice_config, output_path,
+                ):
+                    results["completed"].append(idx)
+                else:
+                    results["failed"].append((idx, "External TTS generation failed"))
+            batch_elapsed = time.time() - batch_start_time
+            batch_audio = sum(
+                self._wav_duration(os.path.join(output_dir, f"temp_batch_{idx}.wav"))
+                for idx in results["completed"]
+                if os.path.exists(os.path.join(output_dir, f"temp_batch_{idx}.wav"))
+            )
+            self._global_audio_duration += batch_audio
+            print(
+                f" -> [Metrics] Batch Runtime: {batch_elapsed:.2f}s | "
+                f"Audio Generated: {batch_audio:.2f}s | "
+                f"BATCH RTF: {batch_elapsed / max(batch_audio, 0.001):.3f}"
+            )
+            return results
+
+        if groups["custom"]:
+            if self._backend == "cpp":
+                custom_results = self._local_batch_custom(
+                    groups["custom"], voice_config, output_dir, batch_seed
+                )
+            else:
+                custom_results = self._local_batch_python(
+                    groups["custom"], voice_config, output_dir
+                )
+            results["completed"].extend(custom_results["completed"])
+            results["failed"].extend(custom_results["failed"])
+        if groups["clone"]:
+            if self._backend != "cpp":
+                clone_results = self._local_batch_clone(
+                    groups["clone"], voice_config, output_dir
+                )
+            elif self._ensure_cpp_model("base") and self._ensure_cpp_codec():
+                clone_results = self._local_batch_cpp_clone(
+                    groups["clone"], voice_config, output_dir
+                )
+            elif self._python_fallback:
+                print("[TTS] Clone batch is using the opted-in Python Qwen3-TTS Base backend.")
+                clone_results = self._local_batch_clone(
+                    groups["clone"], voice_config, output_dir
+                )
+            else:
+                error = "Native C++ clone model not found; Python fallback is disabled."
+                print(f"[TTS] {error}")
+                clone_results = {
+                    "completed": [],
+                    "failed": [(chunk["index"], error) for chunk in groups["clone"]],
+                }
+            results["completed"].extend(clone_results["completed"])
+            results["failed"].extend(clone_results["failed"])
+        if groups["lora"]:
+            lora_results = self._local_batch_lora(
+                groups["lora"], voice_config, output_dir
+            )
+            results["completed"].extend(lora_results["completed"])
+            results["failed"].extend(lora_results["failed"])
+        for chunk in groups["design"]:
+            idx = chunk["index"]
+            output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
+            if self.generate_voice(
+                chunk.get("text", ""), chunk.get("instruct", ""),
+                chunk.get("speaker", ""), voice_config, output_path,
+            ):
+                results["completed"].append(idx)
+            else:
+                results["failed"].append((idx, "VoiceDesign generation failed"))
+        batch_elapsed = time.time() - batch_start_time
+
+        batch_audio = 0.0
+        if "completed" in results:
+            for idx in results["completed"]:
+                target_wav = os.path.join(output_dir, f"temp_batch_{idx}.wav")
+                if os.path.exists(target_wav):
+                    dur = self._wav_duration(target_wav)
+                    batch_audio += dur
+                    self._global_audio_duration += dur
+
+        batch_rtf = batch_elapsed / max(0.001, batch_audio)
+        print(f" -> [Metrics] Batch Runtime: {batch_elapsed:.2f}s | Audio Generated: {batch_audio:.2f}s | BATCH RTF: {batch_rtf:.3f}")
+
+        self._processed_chunks_counter += len(results["completed"]) + len(results["failed"])
+
+        project_manager_path = os.path.join(output_dir, "chunks.json")
+        db_len = 0
+        if os.path.exists(project_manager_path):
+            with open(project_manager_path, "r", encoding="utf-8") as jf:
+                db_len = len(json.load(jf))
+
+        if db_len > 0 and self._processed_chunks_counter >= db_len:
+            global_elapsed = time.time() - self._global_start_time
+            total_audio = self._global_audio_duration
+            if total_audio > 0:
+                print(f"\n=======================================================")
+                print(f"      GLOBAL PIPELINE ENGINE PERFORMANCE METRICS")
+                print(f"=======================================================")
+                print(f" -> Total Generation Compute Time : {global_elapsed:.2f} seconds")
+                print(f" -> Total Audio Duration Compiled  : {total_audio:.2f} seconds")
+                print(f" -> DEFINITIVE GLOBAL ENGINE RTF   : {global_elapsed/max(0.001, total_audio):.3f}")
+                print(f"=======================================================\n")
+            self._global_start_time = 0
+            self._global_audio_duration = 0.0
+            self._processed_chunks_counter = 0
 
         return results
 
-    # ── Connection test ──────────────────────────────────────────
+    def _local_batch_python(self, chunks, voice_config, output_dir):
+        """Generate a local Python batch while preserving the stock engine path."""
+        results = {"completed": [], "failed": []}
+        for chunk in chunks:
+            idx = chunk["index"]
+            output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
+            try:
+                success = self.generate_voice(
+                    chunk.get("text", ""),
+                    chunk.get("instruct", ""),
+                    chunk.get("speaker", ""),
+                    voice_config,
+                    output_path,
+                )
+            except Exception as exc:
+                success = False
+                error = str(exc)
+            else:
+                error = "Python TTS generation failed"
+            if success:
+                results["completed"].append(idx)
+            else:
+                results["failed"].append((idx, error))
+        return results
 
-    # ── Local backend methods ────────────────────────────────────
+    def _local_batch_cpp_clone(self, chunks, voice_config, output_dir):
+        """Generate clone chunks through qwen-tts.cpp without loading Python TTS."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    def _local_generate_custom(self, text, instruct_text, speaker, voice_config, output_path):
-        """Generate custom voice audio using local Qwen3-TTS model."""
-        try:
-            import torch
+        results = {"completed": [], "failed": []}
+        print(f"\n[Blackwell Core] Native clone batch: {len(chunks)} chunks")
 
-            voice_data = voice_config.get(speaker)
-            if not voice_data:
-                print(f"Warning: No voice configuration for '{speaker}'. Skipping.")
-                return False
-
-            voice = voice_data.get("voice", "Ryan")
-            default_style = voice_data.get("default_style", "")
-            seed = int(voice_data.get("seed", -1))
-
-            instruct = instruct_text if instruct_text else (default_style if default_style else "neutral")
-
-            import time
-
-            print(f"TTS [local] generating with instruct='{instruct}' for text='{text[:50]}...'")
-
-            model = self._init_local_custom()
-
-            if seed >= 0:
-                torch.manual_seed(seed)
-
-            t_start = time.time()
-            wavs, sr = model.generate_custom_voice(
-                text=text,
-                language=self._language,
-                speaker=voice,
-                instruct=instruct,
-                non_streaming_mode=True,
-                max_new_tokens=2048,
+        def process_chunk(chunk):
+            idx = chunk["index"]
+            output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
+            success = self._generate_cpp_voice(
+                chunk.get("text", ""),
+                chunk.get("instruct", ""),
+                chunk.get("speaker", ""),
+                voice_config,
+                output_path,
             )
-            gen_time = time.time() - t_start
+            return idx, success
 
-            if wavs is None or len(wavs) == 0:
-                print(f"Error: No audio generated for: '{text[:50]}...'")
-                return False
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(process_chunk, chunk) for chunk in chunks]
+            for future in as_completed(futures):
+                idx, success = future.result()
+                if success:
+                    results["completed"].append(idx)
+                else:
+                    results["failed"].append((idx, "Native C++ clone generation failed"))
 
-            # wavs is a list of numpy arrays; concatenate them
-            audio = np.concatenate(wavs) if len(wavs) > 1 else wavs[0]
-            duration = len(audio) / sr
-            rtf = duration / gen_time if gen_time > 0 else 0
-            print(f"TTS [local] done: {gen_time:.1f}s -> {duration:.1f}s audio ({rtf:.2f}x real-time)")
-            self._save_wav(audio, sr, output_path)
-            return True
-
-        except Exception as e:
-            import traceback
-            print(f"Error generating custom voice for '{speaker}': {e}")
-            traceback.print_exc()
-            return False
-
-    def _local_generate_clone(self, text, speaker, voice_config, output_path):
-        """Generate voice-cloned audio using local Qwen3-TTS Base model."""
-        try:
-            import torch
-
-            voice_data = voice_config.get(speaker)
-            if not voice_data:
-                print(f"Warning: No voice configuration for '{speaker}'. Skipping.")
-                return False
-
-            seed = int(voice_data.get("seed", -1))
-
-            import time
-
-            print(f"TTS [local clone] generating for speaker='{speaker}', text='{text[:50]}...'")
-
-            prompt = self._get_clone_prompt(speaker, voice_config)
-            model = self._init_local_clone()
-
-            if seed >= 0:
-                torch.manual_seed(seed)
-
-            t_start = time.time()
-            wavs, sr = model.generate_voice_clone(
-                text=text,
-                voice_clone_prompt=prompt,
-                non_streaming_mode=True,
-                max_new_tokens=2048,
-            )
-            gen_time = time.time() - t_start
-
-            if wavs is None or len(wavs) == 0:
-                print(f"Error: No audio generated for: '{text[:50]}...'")
-                return False
-
-            audio = np.concatenate(wavs) if len(wavs) > 1 else wavs[0]
-            duration = len(audio) / sr
-            rtf = duration / gen_time if gen_time > 0 else 0
-            print(f"TTS [local clone] done: {gen_time:.1f}s -> {duration:.1f}s audio ({rtf:.2f}x real-time)")
-            self._save_wav(audio, sr, output_path)
-            return True
-
-        except Exception as e:
-            import traceback
-            print(f"Error generating clone voice for '{speaker}': {e}")
-            traceback.print_exc()
-            return False
+        return results
 
     def _local_batch_custom(self, chunks, voice_config, output_dir, batch_seed=-1):
-        """Batch generate custom voice using native list API with sub-batching.
-
-        Autoregressive batch generation runs for as long as the longest sequence.
-        Shorter sequences waste compute on padding. To minimize this, chunks are
-        sorted by text length and split into sub-batches when the length ratio
-        exceeds the configured threshold. Sub-batching can be disabled entirely
-        via config, in which case everything runs as one batch.
-        """
-        import torch
+        """Batch generate custom voice utilizing concurrent execution of optimized C++ binaries with cloning support."""
+        import struct
+        import json
+        import re
         import time
+        import subprocess
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         results = {"completed": [], "failed": []}
 
-        texts = []
-        speakers = []
-        instructs = []
-        indices = []
+        exe_path = self._cpp_executable
+        binary_dir = os.path.dirname(exe_path)
+        model_path = self._ensure_cpp_model("custom")
+        codec_path = self._ensure_cpp_codec()
+        if not model_path or not codec_path:
+            error = "Native C++ CustomVoice model or tokenizer is unavailable."
+            print(f"[TTS] {error}")
+            results["failed"] = [(chunk["index"], error) for chunk in chunks]
+            return results
 
-        for chunk in chunks:
+        max_workers = 4
+        print(f"\n[Blackwell Core] Hijacking local batch queue for {len(chunks)} fragments across {max_workers} parallel C++ threads...")
+
+        def process_single_chunk(chunk):
             idx = chunk["index"]
-            text = chunk.get("text", "")
+            text_val = chunk.get("text", "")
             instruct_text = chunk.get("instruct", "")
-            speaker_name = chunk.get("speaker", "")
+            speaker_name = chunk.get("speaker", "serena")
 
-            voice_data = voice_config.get(speaker_name, {})
-            voice = voice_data.get("voice", "Ryan")
+            voice_data = self._voice_data(speaker_name, voice_config)
+            speaker_val = voice_data.get("voice", speaker_name).lower()
             character_style = voice_data.get("character_style", "") or voice_data.get("default_style", "")
 
-            instruct = instruct_text if instruct_text else "neutral"
+            instruct_val = instruct_text if instruct_text else "neutral"
             if character_style:
-                instruct = f"{instruct} {character_style}"
+                instruct_val = f"{instruct_val} {character_style}"
 
-            texts.append(text)
-            speakers.append(voice)
-            instructs.append(instruct)
-            indices.append(idx)
+            if not instruct_val.strip():
+                instruct_val = "Clear textbook narration; formal and steady tone."
 
-        total_text_chars = sum(len(t) for t in texts)
+            target_wav_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
+            if not text_val.strip():
+                return idx, True, 0, None
 
-        # Sort by text length to group similar-length chunks together.
-        # This reduces wasted padding during autoregressive generation
-        # (the LLM runs until ALL sequences finish, so short chunks
-        # waste compute waiting for long ones).
-        sort_order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
-        texts = [texts[i] for i in sort_order]
-        speakers = [speakers[i] for i in sort_order]
-        instructs = [instructs[i] for i in sort_order]
-        indices = [indices[i] for i in sort_order]
-
-        model = self._init_local_custom()
-
-        # Warmup on first batch to pre-tune MIOpen/GPU solvers
-        if self._warmup_needed:
-            print("Running batch warmup generation...")
-            self._warmup_model(model)
-            self._warmup_needed = False
-
-        # Clear stale GPU cache from any prior generation to avoid
-        # fragmented VRAM blocking large batch allocations (ROCm especially).
-        self._clear_gpu_cache()
-
-
-        max_items = self._estimate_max_batch_size(
-            model, max_text_chars=len(texts[-1]),
-        )
-        sub_batches = self._build_sub_batches(texts, max_items=max_items)
-
-        print(f"Batch [local]: generating {len(texts)} chunks ({total_text_chars} chars) "
-              f"in {len(sub_batches)} sub-batch(es)...")
-
-        t_total_start = time.time()
-        total_audio_duration = 0.0
-
-        for sb_idx, (start, end) in enumerate(sub_batches):
-            sb_texts = texts[start:end]
-            sb_speakers = speakers[start:end]
-            sb_instructs = instructs[start:end]
-            sb_indices = indices[start:end]
-            sb_chars = sum(len(t) for t in sb_texts)
-
-            print(f"  Sub-batch {sb_idx+1}/{len(sub_batches)}: {len(sb_texts)} chunks "
-                  f"({sb_chars} chars, {len(sb_texts[0])}-{len(sb_texts[-1])} chars/chunk)")
+            if self._backend == "cpp":
+                success = self._generate_cpp_voice(
+                    text_val, instruct_val, speaker_name, voice_config, target_wav_path
+                )
+                duration = self._wav_duration(target_wav_path) if success else 0
+                return (
+                    idx,
+                    success,
+                    duration,
+                    None if success else "Native CustomVoice generation failed",
+                )
 
             try:
-                if batch_seed >= 0:
-                    torch.manual_seed(batch_seed)
+                sentences = re.split(r'(?<=[\.!?])\s+', text_val)
+                chunk_files = []
+                sub_idx = 1
 
-                t_start = time.time()
-                wavs_list, sr = model.generate_custom_voice(
-                    text=sb_texts,
-                    language=[self._language] * len(sb_texts),
-                    speaker=sb_speakers,
-                    instruct=sb_instructs,
-                    non_streaming_mode=True,
-                    max_new_tokens=2048,
-                )
-                gen_time = time.time() - t_start
+                for sentence in sentences:
+                    if not sentence.strip():
+                        continue
+                    temp_sub_file = os.path.join(binary_dir, f"temp_fork_batch_chunk_{idx}_{sub_idx}.wav")
 
-                if wavs_list is None:
-                    for idx in sb_indices:
-                        results["failed"].append((idx, "Batch returned None"))
-                    continue
+                    args = [
+                        f'"{exe_path}"',
+                        "--model", f'"{model_path}"',
+                        "--codec", f'"{codec_path}"',
+                        "--speaker", speaker_val if speaker_val != "narrator" else "serena",
+                        "--lang", "English",
+                        "--max-new", "512",
+                        "--instruct", f'"{instruct_val}"',
+                        "-o", f'"{temp_sub_file}"'
+                    ]
 
-                sb_audio_duration = 0.0
-                for i, (wav, idx) in enumerate(zip(wavs_list, sb_indices)):
-                    try:
-                        output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
-                        audio = self._concat_audio(wav)
-                        self._save_wav(audio, sr, output_path)
-                        results["completed"].append(idx)
-                        duration = len(audio) / sr
-                        sb_audio_duration += duration
-                        print(f"    Chunk {idx} saved: {os.path.getsize(output_path)} bytes ({duration:.1f}s audio)")
-                    except Exception as e:
-                        print(f"    Error saving chunk {idx}: {e}")
-                        results["failed"].append((idx, str(e)))
+                    cmd_string = " ".join(args)
+                    p = subprocess.Popen(cmd_string, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=binary_dir)
+                    p.communicate(input=sentence.encode('utf-8'))
 
-                total_audio_duration += sb_audio_duration
-                sb_rtf = sb_audio_duration / gen_time if gen_time > 0 else 0
-                print(f"  Sub-batch {sb_idx+1} done: {gen_time:.1f}s -> {sb_audio_duration:.1f}s audio ({sb_rtf:.2f}x RT)")
+                    if os.path.exists(temp_sub_file):
+                        chunk_files.append(temp_sub_file)
+                    sub_idx += 1
 
+                if chunk_files:
+                    with open(target_wav_path, "wb") as master:
+                        with open(chunk_files[0], "rb") as first:
+                            master.write(first.read())
+                        for i in range(1, len(chunk_files)):
+                            with open(chunk_files[i], "rb") as cf:
+                                data = cf.read()
+                                if len(data) > 44:
+                                    master.write(data[44:])
+
+                    if os.path.exists(target_wav_path):
+                        with open(target_wav_path, "r+b") as master_patch:
+                            master_patch.seek(0, 2)
+                            file_size = master_patch.tell()
+                            master_patch.seek(4)
+                            master_patch.write(struct.pack("<I", file_size - 8))
+                            master_patch.seek(40)
+                            master_patch.write(struct.pack("<I", file_size - 44))
+                        audio_seconds = self._wav_duration(target_wav_path)
+                    else:
+                        audio_seconds = 0
+
+                    for f in chunk_files:
+                        try: os.remove(f)
+                        except: pass
+                    return idx, True, audio_seconds, None
+                else:
+                    return idx, False, 0, "Binary voice generation failed."
             except Exception as e:
-                print(f"  Sub-batch {sb_idx+1} failed: {e}")
-                for idx in sb_indices:
-                    results["failed"].append((idx, f"Batch error: {e}"))
+                return idx, False, 0, str(e)
 
-            # Free GPU memory between sub-batches to prevent VRAM exhaustion
-            self._clear_gpu_cache()
-
-        total_time = time.time() - t_total_start
-        rtf = total_audio_duration / total_time if total_time > 0 else 0
-        print(f"Batch total: {total_time:.1f}s -> {total_audio_duration:.1f}s audio ({rtf:.2f}x real-time)")
-
-
+        total_audio_time = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_chunk = {executor.submit(process_single_chunk, chunk): chunk for chunk in chunks}
+            for future in as_completed(future_to_chunk):
+                p_idx, success, duration, error_msg = future.result()
+                if success:
+                    results["completed"].append(p_idx)
+                else:
+                    results["failed"].append((p_idx, error_msg))
+                    print(f" -> [Blackwell Core] Chunk {p_idx} FAILED: {error_msg}")
 
         return results
 
@@ -1330,15 +1604,6 @@ class TTSEngine:
             speaker_groups.setdefault(speaker, []).append(chunk)
 
         model = self._init_local_clone()
-
-        # Warmup on first batch to pre-tune MIOpen/GPU solvers
-        # Uses CustomVoice model (not Base) since warmup just needs to
-        # exercise MIOpen/GPU solvers and wake the GPU from deep sleep.
-        if self._warmup_needed:
-            warmup_model = self._init_local_custom()
-            print("Running batch warmup generation...")
-            self._warmup_model(warmup_model)
-            self._warmup_needed = False
 
         self._clear_gpu_cache()
 
@@ -1461,15 +1726,6 @@ class TTSEngine:
 
         self._clear_gpu_cache()
 
-
-        # Warmup on first batch to pre-tune MIOpen/GPU solvers
-        # Uses CustomVoice model (not Base) since warmup just needs to
-        # exercise MIOpen/GPU solvers and wake the GPU from deep sleep.
-        if self._warmup_needed:
-            warmup_model = self._init_local_custom()
-            print("Running batch warmup generation...")
-            self._warmup_model(warmup_model)
-            self._warmup_needed = False
 
         t_total_start = time.time()
         total_audio_duration = 0.0
@@ -1616,7 +1872,7 @@ class TTSEngine:
     def _external_generate_custom(self, text, instruct_text, speaker, voice_config, output_path):
         """Generate custom voice audio via external Gradio server."""
         try:
-            voice_data = voice_config.get(speaker)
+            voice_data = self._voice_data(speaker, voice_config)
             if not voice_data:
                 print(f"Warning: No voice configuration for '{speaker}'. Skipping.")
                 return False
@@ -1664,7 +1920,7 @@ class TTSEngine:
         try:
             from gradio_client import handle_file
 
-            voice_data = voice_config.get(speaker)
+            voice_data = self._voice_data(speaker, voice_config)
             if not voice_data:
                 print(f"Warning: No voice configuration for '{speaker}'. Skipping.")
                 return False

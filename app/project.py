@@ -179,7 +179,16 @@ class ProjectManager:
                 logger.warning(f"Alias cycle detected for speaker '{speaker}': chain visited {seen}")
                 break
             seen.add(name)
-            entry = voice_config.get(name, {})
+            entry = voice_config.get(name)
+            if entry is None:
+                matched_name = next(
+                    (key for key in voice_config if key.casefold() == name.casefold()),
+                    None,
+                )
+                if matched_name is not None:
+                    name = matched_name
+                    entry = voice_config[matched_name]
+            entry = entry or {}
             alias = entry.get('alias_of') or entry.get('alias')
             if not alias:
                 break
@@ -187,7 +196,11 @@ class ProjectManager:
             if not isinstance(alias, str) or alias.strip() == '' or alias == name:
                 break
             # Continue resolution
-            name = alias
+            alias_match = next(
+                (key for key in voice_config if key.casefold() == alias.casefold()),
+                alias,
+            )
+            name = alias_match
         return name
 
     def save_chunks(self, chunks):
@@ -809,7 +822,13 @@ class ProjectManager:
             speaker = chunks[idx].get("speaker", "")
             # Resolve alias before grouping so alias groups collate with their canonical speaker
             canonical = self._resolve_alias(speaker, voice_config)
-            voice_data = voice_config.get(canonical, {})
+            voice_data = voice_config.get(canonical)
+            if voice_data is None:
+                voice_data = next(
+                    (value for key, value in voice_config.items()
+                     if key.casefold() == canonical.casefold()),
+                    {},
+                )
             voice_type = voice_data.get("type", "custom")
 
             if voice_type == "clone":

@@ -137,6 +137,14 @@
                                 </select>
                                 <div class="form-text">Device for local model inference</div>
                             </div>
+                            <div class="col-md-4" id="tts-backend-group" style="display:none;">
+                                <label class="form-label">Local TTS Backend</label>
+                                <select class="form-select" id="tts-backend">
+                                    <option value="cpp">Native C++</option>
+                                    <option value="python">Python Qwen3-TTS</option>
+                                </select>
+                                <div class="form-text">Native C++ is the performance path.</div>
+                            </div>
                             <div class="col-md-3" id="tts-language-group">
                                 <label class="form-label">TTS Language</label>
                                 <select class="form-select" id="tts-language">
@@ -166,6 +174,30 @@
                             </div>
                         </div>
                         <div class="row mb-3" id="tts-local-options" style="display:none;">
+                            <div class="col-md-5">
+                                <label class="form-label">C++ Executable</label>
+                                <input type="text" class="form-control" id="cpp-executable">
+                            </div>
+                            <div class="col-md-5">
+                                <label class="form-label">C++ Model Directory</label>
+                                <input type="text" class="form-control" id="cpp-model-dir">
+                            </div>
+                            <div class="col-md-2">
+                                <div class="form-check form-switch mt-4">
+                                    <input class="form-check-input" type="checkbox" id="python-fallback">
+                                    <label class="form-check-label" for="python-fallback">Python fallback</label>
+                                </div>
+                            </div>
+                            <div class="col-md-2 mt-2">
+                                <div class="form-check form-switch mt-2">
+                                    <input class="form-check-input" type="checkbox" id="cpp-auto-download" checked>
+                                    <label class="form-check-label" for="cpp-auto-download">Download GGUFs</label>
+                                </div>
+                            </div>
+                            <div class="col-md-2 mt-2">
+                                <label class="form-label">Native Server Port</label>
+                                <input type="number" class="form-control" id="cpp-server-port" value="4211" min="1024" max="65535">
+                            </div>
                             <div class="col-md-2">
                                 <div class="form-check form-switch mt-4">
                                     <input class="form-check-input" type="checkbox" id="compile-codec">
@@ -1164,6 +1196,7 @@
             const mode = document.getElementById('tts-mode').value;
             document.getElementById('tts-url-group').style.display = mode === 'external' ? '' : 'none';
             document.getElementById('tts-device-group').style.display = mode === 'local' ? '' : 'none';
+            document.getElementById('tts-backend-group').style.display = mode === 'local' ? '' : 'none';
             document.getElementById('tts-local-options').style.display = mode === 'local' ? '' : 'none';
         }
 
@@ -1177,6 +1210,12 @@
                 document.getElementById('llm-key').value = config.llm.api_key;
                 document.getElementById('llm-model').value = config.llm.model_name;
                 document.getElementById('tts-mode').value = config.tts.mode || 'external';
+                document.getElementById('tts-backend').value = config.tts.backend || 'cpp';
+                document.getElementById('cpp-executable').value = config.tts.cpp_executable || 'native\\qwentts-cpp\\build\\Release\\qwen-tts.exe';
+                document.getElementById('cpp-model-dir').value = config.tts.cpp_model_dir || 'native\\qwentts-cpp\\models';
+                document.getElementById('cpp-auto-download').checked = config.tts.cpp_auto_download !== false;
+                document.getElementById('cpp-server-port').value = config.tts.cpp_server_port || 4211;
+                document.getElementById('python-fallback').checked = !!config.tts.python_fallback;
                 document.getElementById('tts-url').value = config.tts.url || 'http://127.0.0.1:7860';
                 document.getElementById('tts-device').value = config.tts.device || 'auto';
                 document.getElementById('tts-language').value = config.tts.language || 'English';
@@ -1355,6 +1394,12 @@
                 },
                 tts: {
                     mode: document.getElementById('tts-mode').value,
+                    backend: document.getElementById('tts-backend').value,
+                    cpp_executable: document.getElementById('cpp-executable').value,
+                    cpp_model_dir: document.getElementById('cpp-model-dir').value,
+                    cpp_auto_download: document.getElementById('cpp-auto-download').checked,
+                    cpp_server_port: parseInt(document.getElementById('cpp-server-port').value) || 4211,
+                    python_fallback: document.getElementById('python-fallback').checked,
                     url: document.getElementById('tts-url').value,
                     device: document.getElementById('tts-device').value,
                     language: document.getElementById('tts-language').value,

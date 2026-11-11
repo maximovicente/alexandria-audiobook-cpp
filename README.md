@@ -143,6 +143,25 @@ The TTS models are **not** included in the install. They download automatically 
 
 > **Tip:** If the download seems stuck, check your internet connection. If it fails, restart the app and try again — it will resume from where it left off.
 
+### Native C++ Backend (Pinokio fork)
+
+This fork adds an optional native qwen-tts.cpp backend. In Setup, choose
+**Local Model** and **Native C++** to use the persistent GPU-resident server.
+The Pinokio installer clones qwen-tts.cpp at the tested revision, builds the
+CUDA binaries on Windows with MSVC/CMake, and downloads the matching 1.7B
+CustomVoice model, Base clone model, and tokenizer into the fork's `native`
+directory. The Python Hugging Face backend remains available by selecting
+**Python Qwen3-TTS**.
+
+Native compilation requires Visual Studio C++ Build Tools, CMake, Ninja, and
+the CUDA toolkit (`nvcc`). A fork-local precompiled `qwen-tts.exe` in
+`native/qwentts-cpp/build/Release` skips compilation. You can also point Setup
+at binaries and models stored elsewhere on the machine.
+
+The native source is pinned to qwen-tts.cpp revision `de2ad83` for reproducible
+installation. Native GGUF assets are downloaded from
+`Serveurperso/Qwen3-TTS-GGUF` on first install or first native use.
+
 ### 3. First Batch Has Extra Warmup Time
 
 The very first batch generation in a session takes longer than subsequent ones:

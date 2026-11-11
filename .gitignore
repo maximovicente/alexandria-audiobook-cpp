@@ -27,6 +27,7 @@ scripts/
 app/config.json
 app/output_audio_cloned/
 app/output_audio/
+app/output/
 /AGENTS.md
 /CLAUDE.md
 /GEMINI.md
@@ -44,6 +45,12 @@ app/error_screenshot.png
 debug_raw_response.txt
 test.txt
 tts_style_test*.json
+
+# Native qwen-tts.cpp source, build output, models, and runtime artifacts
+native/qwentts-cpp/
+temp_master_*.wav
+temp_batch_*.wav.ref.txt
+voiceline_*.mp3
 
 # Python cache
 __pycache__/

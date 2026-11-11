@@ -7,6 +7,16 @@ module.exports = {
   }, {
     method: "fs.rm",
     params: {
+      path: "native/qwentts-cpp/build"
+    }
+  }, {
+    method: "fs.rm",
+    params: {
+      path: "native/qwentts-cpp/models"
+    }
+  }, {
+    method: "fs.rm",
+    params: {
       path: "annotated_script.json"
     }
   }, {

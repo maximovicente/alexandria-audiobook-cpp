@@ -199,6 +199,12 @@ class LLMConfig(BaseModel):
 
 class TTSConfig(BaseModel):
     mode: str = "local"  # "local" or "external"
+    backend: str = "cpp"  # "cpp" or "python" when mode is local
+    cpp_executable: str = r"native\qwentts-cpp\build\Release\qwen-tts.exe"
+    cpp_model_dir: str = r"native\qwentts-cpp\models"
+    cpp_auto_download: bool = True
+    cpp_server_port: int = 4211
+    python_fallback: bool = False
     url: str = "http://127.0.0.1:7860"  # external mode only
     device: str = "auto"  # local mode: "auto", "cuda:0", "cpu", etc.
     language: str = "English"  # TTS language
@@ -934,6 +940,9 @@ async def save_voice_config(config_data: Dict[str, VoiceConfigItem]):
     # Update current config with new data
     for voice_name, config in config_data.items():
         # Convert Pydantic model to dict
+        for existing_name in list(current_config):
+            if existing_name.casefold() == voice_name.casefold() and existing_name != voice_name:
+                del current_config[existing_name]
         current_config[voice_name] = config.model_dump()
 
     atomic_json_write(current_config, VOICE_CONFIG_PATH)
@@ -2563,6 +2572,10 @@ async def preparer_batch_cancel():
 
 
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        import asyncio
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     import uvicorn
     host = os.environ.get("ALEXANDRIA_HOST", "127.0.0.1")
     port = int(os.environ.get("ALEXANDRIA_PORT", "4200"))
