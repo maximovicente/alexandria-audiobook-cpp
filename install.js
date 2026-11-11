@@ -4,7 +4,7 @@ module.exports = {
     params: {
       message: [
         "if not exist native\\qwentts-cpp\\CMakeLists.txt git clone --recurse-submodules https://github.com/ServeurpersoCom/qwentts.cpp.git native\\qwentts-cpp",
-        "git -C native\\qwentts-cpp fetch --depth 1 origin de2ad83",
+        "git -C native\\qwentts-cpp fetch --tags origin",
         "git -C native\\qwentts-cpp checkout --force de2ad83",
         "git -C native\\qwentts-cpp submodule update --init --recursive"
       ]

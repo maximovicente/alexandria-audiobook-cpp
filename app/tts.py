@@ -11,6 +11,7 @@ import urllib.request
 import urllib.error
 import base64
 import hashlib
+import atexit
 
 DEFAULT_PAUSE_MS = 500  # Pause between different speakers
 SAME_SPEAKER_PAUSE_MS = 250  # Shorter pause for same speaker continuing
@@ -144,6 +145,8 @@ class TTSEngine:
         self._cpp_clone_voice = None
         self._cpp_server_model = None
         self._cpp_clone_server_lock = threading.Lock()
+        self._cpp_error_local = threading.local()
+        atexit.register(self.close)
 
     @staticmethod
     def _resolve_cpp_path(value, project_root):
@@ -664,6 +667,7 @@ class TTSEngine:
         indefinitely. Next TTS call re-loads on demand.
         """
         with self._model_lock:
+            self._stop_cpp_server()
             unloaded = []
             for attr in ("_local_custom_model", "_local_clone_model",
                          "_local_design_model", "_local_lora_model"):
@@ -678,6 +682,27 @@ class TTSEngine:
                 print(f"Unloaded TTS models: {', '.join(unloaded)}")
                 self._clear_gpu_cache()
             return unloaded
+
+    def _stop_cpp_server(self):
+        with self._cpp_clone_server_lock:
+            server = self._cpp_clone_server
+            self._cpp_clone_server = None
+            self._cpp_server_model = None
+            self._cpp_clone_voice = None
+            if server is None or server.poll() is not None:
+                return
+            server.terminate()
+            try:
+                server.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                server.kill()
+
+    def close(self):
+        """Stop owned native processes during app shutdown."""
+        try:
+            self._stop_cpp_server()
+        except Exception as exc:
+            print(f"[TTS] Native server cleanup warning: {exc}")
 
     def _init_external(self):
         """Create Gradio client on demand."""
@@ -757,6 +782,7 @@ class TTSEngine:
         import time
         import wave
 
+        self._cpp_error_local.message = None
         exe_path = self._cpp_executable
         binary_dir = os.path.dirname(exe_path)
         codec_path = os.path.join(self._cpp_model_dir, "qwen-tokenizer-12hz-Q8_0.gguf")
@@ -771,6 +797,9 @@ class TTSEngine:
             model_path = self._ensure_cpp_model("custom")
             codec_path = self._ensure_cpp_codec()
             if not model_path or not codec_path:
+                self._cpp_error_local.message = (
+                    "Native CustomVoice model or tokenizer is unavailable"
+                )
                 return None
             speaker_value = (voice_data.get("voice") or speaker).lower()
             instruct_value = (instruct_text or voice_data.get("default_style") or "neutral").strip()
@@ -785,7 +814,9 @@ class TTSEngine:
                     output_path,
                 )
             except Exception as exc:
-                print(f"[Blackwell Core] Native CustomVoice server failed: {exc}")
+                message = f"Native CustomVoice server failed: {exc}"
+                self._cpp_error_local.message = message
+                print(f"[Blackwell Core] {message}")
                 return False
             elapsed = time.time() - generation_start
             audio_duration = self._wav_duration(output_path)
@@ -803,6 +834,7 @@ class TTSEngine:
             ref_text = voice_data.get("ref_text")
             if not model_path or not ref_audio_path or not ref_text:
                 if not model_path:
+                    self._cpp_error_local.message = "Native clone Base model is unavailable"
                     print(
                         "[Blackwell Core] Native clone model unavailable; "
                         "using the configured Python clone backend."
@@ -812,6 +844,7 @@ class TTSEngine:
                 root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                 ref_audio_path = os.path.join(root_dir, ref_audio_path)
             if not os.path.isfile(ref_audio_path):
+                self._cpp_error_local.message = f"Clone reference audio not found: {ref_audio_path}"
                 return None
             print(f"[Blackwell Core] Generating single {voice_type} segment for '{speaker}'...")
             generation_start = time.time()
@@ -821,7 +854,9 @@ class TTSEngine:
                 )
                 self._request_cpp_clone(text, voice_key, output_path)
             except Exception as exc:
-                print(f"[Blackwell Core] Native clone server failed: {exc}")
+                message = f"Native clone server failed: {exc}"
+                self._cpp_error_local.message = message
+                print(f"[Blackwell Core] {message}")
                 return False
             elapsed = time.time() - generation_start
             audio_duration = self._wav_duration(output_path)
@@ -992,6 +1027,14 @@ class TTSEngine:
         voice_type = voice_data.get("type", "custom")
 
         if self._mode == "local" and self._backend == "cpp":
+            if voice_type not in ("custom", "clone"):
+                message = (
+                    f"Native C++ backend does not support voice type '{voice_type}' "
+                    "for this segment; select Python backend or enable fallback."
+                )
+                print(f"[TTS] {message}")
+                if not self._python_fallback:
+                    return False
             cpp_result = self._generate_cpp_voice(
                 text, instruct_text, speaker, voice_config, output_path
             )
@@ -1442,16 +1485,19 @@ class TTSEngine:
                 voice_config,
                 output_path,
             )
-            return idx, success
+            return idx, success, getattr(self._cpp_error_local, "message", None)
 
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = [executor.submit(process_chunk, chunk) for chunk in chunks]
             for future in as_completed(futures):
-                idx, success = future.result()
+                idx, success, error = future.result()
                 if success:
                     results["completed"].append(idx)
                 else:
-                    results["failed"].append((idx, "Native C++ clone generation failed"))
+                    results["failed"].append((
+                        idx,
+                        error or "Native C++ clone generation failed",
+                    ))
 
         return results
 
@@ -1509,7 +1555,10 @@ class TTSEngine:
                     idx,
                     success,
                     duration,
-                    None if success else "Native CustomVoice generation failed",
+                    None if success else (
+                        getattr(self._cpp_error_local, "message", None)
+                        or "Native CustomVoice generation failed"
+                    ),
                 )
 
             try:
