@@ -4,6 +4,8 @@ setlocal EnableExtensions
 set "ROOT=%~dp0"
 set "SOURCE=%ROOT%native\qwentts-cpp"
 set "BUILD=%SOURCE%\build"
+set "CC="
+set "CXX="
 
 if not exist "%SOURCE%\CMakeLists.txt" (
   echo [Native] qwentts.cpp source is missing: %SOURCE%
@@ -30,6 +32,11 @@ if errorlevel 1 exit /b 1
 where cmake >nul 2>nul
 if errorlevel 1 (
   echo [Native] cmake is required.
+  exit /b 1
+)
+where ninja >nul 2>nul
+if errorlevel 1 (
+  echo [Native] ninja is required.
   exit /b 1
 )
 where nvcc >nul 2>nul

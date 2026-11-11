@@ -44,8 +44,13 @@ module.exports = {
   }, {
     method: "shell.run",
     params: {
+      message: "conda install -y -c conda-forge cmake ninja"
+    }
+  }, {
+    method: "shell.run",
+    params: {
       path: ".",
-      message: "if exist native\\qwentts-cpp\\build\\Release\\qwen-tts.exe (echo [Native] Using existing precompiled qwen-tts.cpp binaries) else (cmd /c build_native.cmd)"
+      message: "if exist native\\qwentts-cpp\\build\\Release\\qwen-tts.exe (echo [Native] Using existing precompiled qwen-tts.cpp binaries) else (cmd /c build_native.cmd && if not exist native\\qwentts-cpp\\build\\Release\\qwen-tts.exe exit /b 1)"
     }
   }, {
     method: "shell.run",
