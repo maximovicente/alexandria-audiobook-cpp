@@ -146,6 +146,9 @@ class TTSEngine:
         self._cpp_server_model = None
         self._cpp_clone_server_lock = threading.Lock()
         self._cpp_error_local = threading.local()
+        # Prompt caches for clone and LoRA voice generation.
+        self._clone_prompt_cache = {}
+        self._lora_prompt_cache = {}
         atexit.register(self.close)
 
     @staticmethod
@@ -153,11 +156,6 @@ class TTSEngine:
         if os.path.isabs(value):
             return value
         return os.path.abspath(os.path.join(project_root, value))
-
-        # Clone prompt cache: speaker_name -> (ref_audio_path, reusable voice_clone_prompt)
-        self._clone_prompt_cache = {}
-        # LoRA clone prompt cache: adapter_path -> reusable voice_clone_prompt
-        self._lora_prompt_cache = {}
 
     @property
     def mode(self):
